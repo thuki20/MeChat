@@ -45,16 +45,21 @@ final class WeChatDataScanner {
         loadCache()
     }
 
-    /// 扫描 ~/Library/Containers 下所有微信相关容器（原版 + 各多开实例）
+    /// 扫描 ~/Library/Containers 下微信相关容器：仅原版 + 当前有效多开实例。
+    /// 已删除实例残留的孤儿容器不再列入（否则用户删掉的实例会反复出现在数据源抽屉）。
     func scan() -> [WeChatDataSource] {
         let containers = expand("~/Library/Containers")
         var out: [WeChatDataSource] = []
         guard let items = try? FileManager.default.contentsOfDirectory(atPath: containers) else { return out }
+        // 有效 bundleId = 当前配置里的实例；原版单独放行
+        let activeIds = Set(ConfigStore.shared.instances.map { $0.bundleId })
         for id in items {
             let lower = id.lowercased()
             guard lower.contains("wechat") || lower.contains("xinwechat") else { continue }
             // 排除微信的辅助/扩展容器（非数据源）
             if lower.contains("fileproviderextension") || lower.contains("macshare") || lower.contains("helper") { continue }
+            // 排除孤儿多开容器：既不是原版，也不在当前实例配置里
+            if id != ORIGINAL_ID && !activeIds.contains(id) { continue }
             let dataPath = containers + "/\(id)/Data"
             guard FileManager.default.fileExists(atPath: dataPath) else { continue }
             out.append(make(bundleId: id, dataPath: dataPath))

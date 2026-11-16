@@ -206,10 +206,38 @@ final class WeChatManager {
         _ = shell(["/usr/bin/open", path])
     }
 
-    func delete(_ inst: Instance) {
-        try? FileManager.default.removeItem(atPath: inst.appPath)
-        try? FileManager.default.removeItem(atPath: expand("~/Library/Containers/\(inst.bundleId)"))
+    /// 删除实例：彻底清理应用副本与数据容器，返回删除失败项（不静默吞错）。
+    /// 兼容老版本把副本放在配置根目录的情况；容器被占用时如实上报，由 UI 提示用户。
+    @discardableResult
+    func delete(_ inst: Instance) -> (removed: [String], failed: [String]) {
+        var removed: [String] = []
+        var failed: [String] = []
+        let name = (inst.appPath as NSString).lastPathComponent
+        // 副本可能在 实例/ 子目录（现行）或配置根目录（老版本），都尝试清理
+        let appPaths = [inst.appPath, copiesDir + "/" + name, appSupportDir + "/" + name]
+        var seen = Set<String>()
+        for p in appPaths where !seen.contains(p) {
+            seen.insert(p)
+            guard FileManager.default.fileExists(atPath: p) else { continue }
+            do {
+                try FileManager.default.removeItem(atPath: p)
+                removed.append("应用副本 \(name)")
+            } catch {
+                failed.append("应用副本 \(p)：\(error.localizedDescription)")
+            }
+        }
+        // 数据容器：删除失败通常是微信仍在运行，必须让用户知道
+        let container = expand("~/Library/Containers/\(inst.bundleId)")
+        if FileManager.default.fileExists(atPath: container) {
+            do {
+                try FileManager.default.removeItem(atPath: container)
+                removed.append("数据容器 \(inst.bundleId)")
+            } catch {
+                failed.append("数据容器 \(inst.bundleId)：\(error.localizedDescription)（请先退出该微信实例）")
+            }
+        }
         ConfigStore.shared.instances.removeAll { $0.id == inst.id }
         ConfigStore.shared.save()
+        return (removed, failed)
     }
 }

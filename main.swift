@@ -98,7 +98,7 @@ final class GradientBackground: NSView {
 
 // MARK: - 应用代理
 
-final class AppDelegate: NSObject, NSApplicationDelegate,
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
                           NSTableViewDataSource, NSTableViewDelegate {
 
     private var window: NSWindow!
@@ -119,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private var listContainer: FlippedView!
     private var instancesHeader: NSTextField!
+    private var listScroll: NSScrollView!
 
     private var stepCircles: [NSImageView] = []
     private var stepLabels: [NSTextField] = []
@@ -128,6 +129,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private var progressDetail: NSTextField!
 
     private let mgr = WeChatManager()
+    private var versionField: NSTextField!
+    private var updateBtn: NSButton!
+    private var progressPanel: NSAlert?
 
     // macOS 圆形步骤卡片（待处理 / 进行中 / 完成）
     private enum StepState { case pending, active, done }
@@ -175,22 +179,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     func applicationDidFinishLaunching(_ n: Notification) {
         buildUI()
         refreshList()
+        // 启动 2 秒后静默检查更新，不打断用户操作
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) {
+            self.silentCheckUpdate()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
 
+    // 窗口缩放后按新宽度重排实例行与分隔线
+    func windowDidResize(_ notification: Notification) {
+        guard window != nil, listContainer != nil else { return }
+        refreshList()
+    }
+
     // MARK: 界面搭建
 
     private func buildUI() {
-        let size = NSSize(width: 560, height: 740)
+        let size = NSSize(width: 660, height: 850)
         window = NSWindow(contentRect: NSRect(origin: .zero, size: size),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         window.title = "MeChat"
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
-        window.minSize = NSSize(width: 540, height: 700)
-        window.maxSize = NSSize(width: 700, height: 1000)
+        window.delegate = self
+        // 实例行按窗口宽度自适应，最小宽度仍需容纳「图标+名字+5 个按钮」
+        window.minSize = NSSize(width: 640, height: 760)
+        window.maxSize = NSSize(width: 980, height: 1200)
         window.center()
 
         rootEffect = NSVisualEffectView(frame: window.contentView!.bounds)
@@ -224,8 +240,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         skinControl = NSSegmentedControl(labels: skinNames, trackingMode: .selectOne,
                                          target: self, action: #selector(skinChanged))
         skinControl.selectedSegment = 0
-        skinControl.frame = NSRect(x: 360, y: y + 1, width: 178, height: 26)
+        // 靠右对齐：标题右侧到窗口右边缘 22pt，避免加宽后控件 stranded 在中间
+        skinControl.frame = NSRect(x: w - 200, y: y + 1, width: 178, height: 26)
         base.addSubview(skinControl)
+
+        // 检查更新按钮 + 当前版本号（在皮肤切换左侧）
+        updateBtn = NSButton(title: "检查更新", target: self, action: #selector(checkUpdatePressed))
+        updateBtn.bezelStyle = .rounded
+        updateBtn.controlSize = .small
+        updateBtn.font = NSFont.systemFont(ofSize: 12)
+        updateBtn.frame = NSRect(x: w - 322, y: y + 2, width: 84, height: 26)
+        base.addSubview(updateBtn)
+
+        let ver = AppUpdater.shared.currentVersion
+        versionField = NSTextField(labelWithString: "v\(ver)")
+        versionField.font = NSFont.systemFont(ofSize: 11)
+        versionField.textColor = .tertiaryLabelColor
+        versionField.frame = NSRect(x: w - 390, y: y + 6, width: 62, height: 18)
+        base.addSubview(versionField)
         y += 44
 
         base.addSubview(line(y: y))
@@ -620,60 +652,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     private func refreshList() {
         instancesHeader.stringValue = "我的微信（\(ConfigStore.shared.instances.count)）"
         for v in listContainer.subviews { v.removeFromSuperview() }
+
+        // 列表宽度跟随窗口；减去滚动条与左右 22pt 内边距
+        let listWidth = max(window.contentView!.bounds.width - 44, 480)
+        let rowW = listWidth - 12
         var y: CGFloat = 6
         if ConfigStore.shared.instances.isEmpty {
             let l = NSTextField(labelWithString: "还没有多开实例，先在上面创建一个吧。")
             l.textColor = .secondaryLabelColor
-            l.frame = NSRect(x: 4, y: y, width: 400, height: 22)
+            l.frame = NSRect(x: 8, y: y, width: listWidth - 16, height: 22)
             listContainer.addSubview(l)
-            y += 22
+            y += 26
         } else {
             for inst in ConfigStore.shared.instances {
-                let row = instanceRow(inst)
-                row.frame = NSRect(x: 4, y: y, width: 496, height: 40)
+                let row = instanceRow(inst, width: rowW)
+                row.frame = NSRect(x: 6, y: y, width: rowW, height: 58)
                 listContainer.addSubview(row)
-                y += 50
+                y += 66
             }
         }
-        listContainer.frame = NSRect(x: 0, y: 0, width: 512, height: max(y + 6, 100))
+        listContainer.frame = NSRect(x: 0, y: 0, width: listWidth, height: max(y + 6, 100))
     }
 
-    private func instanceRow(_ inst: Instance) -> NSView {
-        let row = GlassView(frame: NSRect(x: 0, y: 0, width: 496, height: 40))
-        row.cornerRadius = 10
-        row.baseAlpha = 0.5
-        row.hoverAlpha = 0.9
+    private func instanceRow(_ inst: Instance, width rowW: CGFloat) -> NSView {
+        let row = GlassView(frame: NSRect(x: 0, y: 0, width: rowW, height: 58))
+        row.cornerRadius = 12
+        row.baseAlpha = 0.55
+        row.hoverAlpha = 0.95
         row.refresh()
 
-        let iconView = NSImageView(image: makeVectorIcon(inst.colorHex, size: 28))
-        iconView.frame = NSRect(x: 8, y: 6, width: 28, height: 28)
+        // 图标放大到 36pt，作为实例的第一视觉锚点
+        let iconView = NSImageView(image: makeVectorIcon(inst.colorHex, size: 36))
+        iconView.frame = NSRect(x: 12, y: 11, width: 36, height: 36)
         row.addSubview(iconView)
 
+        // 名字 + 来源两行排布，名字加粗放大，来源行附带 bundleId 尾号便于分辨
+        let nameW = max(rowW - 12 - 48 - 12 - 244 - 12, 90)
         let name = NSTextField(labelWithString: inst.name)
-        name.font = NSFont.systemFont(ofSize: 14, weight: .medium)
-        name.frame = NSRect(x: 44, y: 10, width: 110, height: 22)
+        name.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+        name.lineBreakMode = .byTruncatingTail
+        name.frame = NSRect(x: 58, y: 24, width: nameW, height: 22)
         row.addSubview(name)
 
-        let tag = NSTextField(labelWithString: inst.dataSource == "seed" ? "沿用数据" : "全新数据")
+        let suffix = inst.bundleId.replacingOccurrences(of: "com.tencent.xinWeChat", with: "")
+        let detail = (inst.dataSource == "seed" ? "沿用数据" : "全新数据") + (suffix.isEmpty ? "" : " · \(suffix)")
+        let tag = NSTextField(labelWithString: detail)
         tag.font = NSFont.systemFont(ofSize: 11)
         tag.textColor = .secondaryLabelColor
-        tag.frame = NSRect(x: 158, y: 13, width: 76, height: 16)
+        tag.lineBreakMode = .byTruncatingTail
+        tag.frame = NSRect(x: 58, y: 7, width: nameW, height: 16)
         row.addSubview(tag)
 
-        var bx: CGFloat = 246
-        let btns: [(String, Selector)] = [("打开", #selector(openPressed(_:))),
-                                          ("改名", #selector(renamePressed(_:))),
-                                          ("换色", #selector(colorChangePressed(_:))),
-                                          ("删除", #selector(deletePressed(_:))),
-                                          ("访达", #selector(revealPressed(_:)))]
-        for (t, sel) in btns {
+        // 按钮右对齐：5 个 ×44 + 4 个间隔 ×6 = 244pt，整组贴右边缘
+        let bw: CGFloat = 44, gap: CGFloat = 6
+        var bx = rowW - 12 - (5 * bw + 4 * gap)
+        let btns: [(String, Selector, NSColor?)] = [
+            ("打开", #selector(openPressed(_:)), .controlAccentColor),
+            ("改名", #selector(renamePressed(_:)), nil),
+            ("换色", #selector(colorChangePressed(_:)), nil),
+            ("删除", #selector(deletePressed(_:)), .systemRed),
+            ("访达", #selector(revealPressed(_:)), nil),
+        ]
+        for (t, sel, tint) in btns {
             let b = NSButton(title: t, target: self, action: sel)
             b.bezelStyle = .rounded
             b.controlSize = .small
+            b.font = NSFont.systemFont(ofSize: 12, weight: t == "打开" ? .semibold : .regular)
+            if let tint = tint { b.contentTintColor = tint }
             b.tag = inst.id
-            b.frame = NSRect(x: bx, y: 4, width: 44, height: 28)
+            b.frame = NSRect(x: bx, y: 15, width: bw, height: 28)
             row.addSubview(b)
-            bx += 47
+            bx += bw + gap
         }
         return row
     }
@@ -690,6 +739,120 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc private func revealPressed(_ s: NSButton) {
         guard let i = instance(s.tag) else { return }
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: i.appPath)])
+    }
+
+    // MARK: - 应用内更新（OTA）
+
+    private func silentCheckUpdate() {
+        let result = AppUpdater.shared.check()
+        DispatchQueue.main.async {
+            if case .available(let info) = result {
+                self.versionField.stringValue = "v\(info.version) 可用"
+                self.versionField.textColor = .controlAccentColor
+                self.updateBtn.title = "更新到 v\(info.version)"
+                self.updateBtn.contentTintColor = .controlAccentColor
+            }
+        }
+    }
+
+    @objc private func checkUpdatePressed() {
+        updateBtn.isEnabled = false
+        let oldTitle = updateBtn.title
+        updateBtn.title = "检查中…"
+        DispatchQueue.global(qos: .utility).async {
+            let result = AppUpdater.shared.check()
+            DispatchQueue.main.async {
+                self.updateBtn.isEnabled = true
+                switch result {
+                case .upToDate:
+                    self.updateBtn.title = oldTitle
+                    self.versionField.stringValue = "v\(AppUpdater.shared.currentVersion)"
+                    self.versionField.textColor = .tertiaryLabelColor
+                    let a = NSAlert()
+                    a.messageText = "已是最新版本"
+                    a.informativeText = "当前 v\(AppUpdater.shared.currentVersion) 已是最新。"
+                    a.runModal()
+                case .failed(let msg):
+                    self.updateBtn.title = oldTitle
+                    let a = NSAlert()
+                    a.alertStyle = .warning
+                    a.messageText = "检查更新失败"
+                    a.informativeText = msg
+                    a.runModal()
+                case .available(let info):
+                    self.updateBtn.title = oldTitle
+                    self.showUpdateDialog(info)
+                }
+            }
+        }
+    }
+
+    private func showUpdateDialog(_ info: UpdateInfo) {
+        let a = NSAlert()
+        a.messageText = "发现新版本 v\(info.version)"
+        let notes = info.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        a.informativeText = notes.isEmpty ? "当前 v\(AppUpdater.shared.currentVersion)，是否现在更新？"
+                                          : "当前 v\(AppUpdater.shared.currentVersion)\n\n\(notes)"
+        a.addButton(withTitle: "立即更新")
+        a.addButton(withTitle: "稍后")
+        let resp = a.runModal()
+        if resp == .alertFirstButtonReturn { startUpdate(info) }
+    }
+
+    private func startUpdate(_ info: UpdateInfo) {
+        let panel = NSAlert()
+        panel.messageText = "正在更新到 v\(info.version)"
+        panel.informativeText = "下载并校验中，请勿关闭应用…\n0%"
+        panel.addButton(withTitle: "取消")
+        let bar = NSProgressIndicator(frame: NSRect(x: 0, y: 0, width: 260, height: 12))
+        bar.style = .bar
+        bar.isIndeterminate = false
+        bar.minValue = 0; bar.maxValue = 1; bar.doubleValue = 0
+        panel.accessoryView = bar
+        self.progressPanel = panel
+
+        // NSAlert 在非模态 sheet 下用定时器驱动进度展示
+        let win = panel.window
+        var didFinish = false
+        win.makeKeyAndOrderFront(nil)
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                _ = try AppUpdater.shared.downloadAndPrepare(info) { p in
+                    DispatchQueue.main.async {
+                        bar.doubleValue = p
+                        panel.informativeText = String(format: "下载并校验中，请勿关闭应用…\n%.0f%%", p * 100)
+                    }
+                }
+                if didFinish { return }
+                try AppUpdater.shared.launchInstaller()
+                DispatchQueue.main.async {
+                    didFinish = true
+                    win.close()
+                    NSApp.terminate(nil)   // 覆盖脚本接管换包 + 自动重启
+                }
+            } catch let e as LocalizedError {
+                DispatchQueue.main.async {
+                    didFinish = true
+                    win.close()
+                    let fail = NSAlert()
+                    fail.alertStyle = .warning
+                    fail.messageText = "更新失败"
+                    fail.informativeText = e.errorDescription ?? "\(e)"
+                    fail.runModal()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    didFinish = true
+                    win.close()
+                    let fail = NSAlert()
+                    fail.alertStyle = .warning
+                    fail.messageText = "更新失败"
+                    fail.informativeText = "\(error)"
+                    fail.runModal()
+                }
+            }
+        }
+        _ = didFinish
     }
 
     @objc private func renamePressed(_ s: NSButton) {
@@ -752,8 +915,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate,
         alert.addButton(withTitle: "删除")
         alert.addButton(withTitle: "取消")
         if alert.runModal() == .alertFirstButtonReturn {
-            mgr.delete(i)
+            let result = mgr.delete(i)
             refreshList()
+            if !result.failed.isEmpty {
+                let warn = NSAlert()
+                warn.alertStyle = .warning
+                warn.messageText = "实例已移除，但部分文件未能删除"
+                warn.informativeText = result.failed.joined(separator: "\n") +
+                    "\n\n可先退出对应微信实例后重试，或稍后手动清理。"
+                warn.addButton(withTitle: "知道了")
+                warn.runModal()
+            }
         }
     }
 }
