@@ -109,6 +109,67 @@ func makeVectorIcon(_ colorHex: String, size: CGFloat = 128) -> NSImage {
 func applyIcon(to appPath: String, colorHex: String) {
     let img = makeVectorIcon(colorHex)
     _ = NSWorkspace.shared.setIcon(img, forFile: appPath)
+
+    // Launch Services / Dock 会缓存 app 图标，只 setIcon 不够：
+    // 必须重新注册 bundle 并重启 Dock，已有程序坞图标才会跟着换色。
+    let lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    shell(["/usr/bin/touch", appPath])
+    shell([lsregister, "-f", appPath])
+
+    let link = expand("~/Applications/\((appPath as NSString).lastPathComponent)")
+    if FileManager.default.fileExists(atPath: link) {
+        // 启动台/程序坞若固定的是 ~/Applications 链接，链接自身的图标也要刷
+        _ = NSWorkspace.shared.setIcon(img, forFile: link)
+        shell(["/usr/bin/touch", "-h", link])
+        shell([lsregister, "-f", link])
+    }
+    shell(["/usr/bin/killall", "Dock"])
+}
+
+/// 同步 app 的显示名：Info.plist + 所有 *.lproj/InfoPlist.strings。
+/// 本地化 strings 优先级高于 plist，漏改会导致启动台/访达仍显示旧名（如"微信"）。
+/// 注意：这些 plist 文件带 xattr，重签前必须清 xattr 否则报 detritus not allowed。
+func updateDisplayNames(_ appPath: String, to name: String) {
+    let fm = FileManager.default
+    let plist = appPath + "/Contents/Info.plist"
+    shell(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleName \(name)", plist])
+    shell(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleDisplayName \(name)", plist])
+    let res = appPath + "/Contents/Resources"
+    if let items = try? fm.contentsOfDirectory(atPath: res) {
+        for d in items where d.hasSuffix(".lproj") {
+            let f = res + "/" + d + "/InfoPlist.strings"
+            guard fm.fileExists(atPath: f) else { continue }
+            // 微信的 InfoPlist.strings 是 XML plist 格式，用 PlistBuddy 改最稳
+            shell(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleDisplayName \(name)", f])
+            shell(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleName \(name)", f])
+        }
+    }
+    // 清 xattr + 重签，否则改过的 bundle 会因 detritus 拒绝签名/启动
+    shell(["/usr/bin/xattr", "-cr", appPath])
+    shell(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", appPath])
+}
+
+/// 在 ~/Applications 维护指向实例副本的符号链接，让 Launchpad/应用程序收录多开实例。
+func syncLauncherLink(instanceName: String, appPath: String, remove: Bool = false) {
+    let fm = FileManager.default
+    let appsDir = expand("~/Applications")
+    try? fm.createDirectory(atPath: appsDir, withIntermediateDirectories: true)
+    let link = appsDir + "/\(instanceName).app"
+    if remove {
+        if fm.fileExists(atPath: link) { try? fm.removeItem(atPath: link) }
+    } else {
+        // 若已有同名链接指向别处，先删再建（改名场景）
+        if fm.fileExists(atPath: link) { try? fm.removeItem(atPath: link) }
+        try? fm.createSymbolicLink(atPath: link, withDestinationPath: appPath)
+    }
+    // 通知 Launch Services 刷新单个 app（扫整个 ~/Applications 会报 -10811 权限错）
+    let lsregister = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+    shell([lsregister, "-f", link])
+}
+
+/// 删除实例时清理 ~/Applications 下的启动台链接
+func removeLauncherLink(instanceName: String) {
+    syncLauncherLink(instanceName: "", appPath: "", remove: true)
 }
 
 // MeChat 主 LOGO（微信风格，绿底白气泡）
@@ -159,20 +220,23 @@ final class WeChatManager {
             if err == nil {
                 let plist = dest + "/Contents/Info.plist"
                 shell(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleIdentifier \(bundleId)", plist])
-                shell(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleName \(name)", plist])
-                shell(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleDisplayName \(name)", plist])
+                // 同步 plist + 所有 lproj 本地化显示名，并清 xattr、重签
+                updateDisplayNames(dest, to: name)
             }
             onStep("准备应用信息", 70)
 
             onStep("完成系统授权", 72)
+            // updateDisplayNames 已完成清 xattr 与重签，这里复核签名有效性
             if err == nil {
-                let (o2, c2) = shell(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", dest])
+                let (o2, c2) = shell(["/usr/bin/codesign", "-v", dest])
                 if c2 != 0 { err = "系统授权失败：\(o2.isEmpty ? "临时签名未通过" : o2)" }
             }
             onStep("完成系统授权", 88)
 
             if err == nil {
                 applyIcon(to: dest, colorHex: colorHex)
+                // 在 ~/Applications 建启动台链接
+                syncLauncherLink(instanceName: name, appPath: dest)
             }
 
             // 数据来源
@@ -236,6 +300,8 @@ final class WeChatManager {
                 failed.append("数据容器 \(inst.bundleId)：\(error.localizedDescription)（请先退出该微信实例）")
             }
         }
+        // 清理 ~/Applications 下的启动台链接
+        removeLauncherLink(instanceName: inst.name)
         ConfigStore.shared.instances.removeAll { $0.id == inst.id }
         ConfigStore.shared.save()
         return (removed, failed)

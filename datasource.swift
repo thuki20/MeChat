@@ -205,6 +205,9 @@ final class DataSourceDrawerController: NSObject, NSTableViewDataSource, NSTable
 
         let scroll = NSScrollView(frame: NSRect(x: 14, y: 60, width: cw - 28, height: drawerHeight - 116))
         scroll.hasVerticalScroller = true
+        // 列宽总和超出可视区时允许左右滑动，避免路径/名称被永久截断
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = false
         tableView.dataSource = self
         tableView.delegate = self
         tableView.rowHeight = 30
@@ -212,16 +215,16 @@ final class DataSourceDrawerController: NSObject, NSTableViewDataSource, NSTable
         tableView.usesAlternatingRowBackgroundColors = true
 
         let cName = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("name"))
-        cName.title = "微信数据"; cName.width = 150
+        cName.title = "微信数据"; cName.width = 210
         tableView.addTableColumn(cName)
         let cPath = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("path"))
-        cPath.title = "根目录"; cPath.width = 220
+        cPath.title = "根目录"; cPath.width = 380
         tableView.addTableColumn(cPath)
         let cSize = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("size"))
-        cSize.title = "大小"; cSize.width = 90
+        cSize.title = "大小"; cSize.width = 100
         tableView.addTableColumn(cSize)
         let cMod = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("mod"))
-        cMod.title = "最后修改"; cMod.width = 100
+        cMod.title = "最后修改"; cMod.width = 130
         tableView.addTableColumn(cMod)
 
         scroll.documentView = tableView

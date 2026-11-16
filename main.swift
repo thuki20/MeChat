@@ -871,11 +871,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
             // 重命名 app 目录
             let newPath = copiesDir + "/\(newName).app"
             try? FileManager.default.moveItem(atPath: i.appPath, toPath: newPath)
-            let plist = newPath + "/Contents/Info.plist"
-            shell(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleName \(newName)", plist])
-            shell(["/usr/libexec/PlistBuddy", "-c", "Set :CFBundleDisplayName \(newName)", plist])
-            shell(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", newPath])
+            // 同步 plist + 所有 lproj 本地化显示名，并清 xattr、重签
+            updateDisplayNames(newPath, to: newName)
             applyIcon(to: newPath, colorHex: i.colorHex)
+            // 重建启动台链接：先删旧名链接，再建新名链接
+            removeLauncherLink(instanceName: i.name)
+            syncLauncherLink(instanceName: newName, appPath: newPath)
             if let idx = ConfigStore.shared.instances.firstIndex(where: { $0.id == i.id }) {
                 ConfigStore.shared.instances[idx].name = newName
                 ConfigStore.shared.instances[idx].appPath = newPath
@@ -887,24 +888,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate,
 
     @objc private func colorChangePressed(_ s: NSButton) {
         guard let i = instance(s.tag) else { return }
-        let c = NSColorPanel.shared
-        c.color = color(i.colorHex)
-        c.setTarget(self)
-        c.setAction(#selector(colorPanelDone(_:)))
-        c.makeKeyAndOrderFront(nil)
-        pendingColorInstance = i
-    }
-    private var pendingColorInstance: Instance?
-
-    @objc private func colorPanelDone(_ sender: NSColorPanel) {
-        guard let i = pendingColorInstance else { return }
-        let newHex = hex(sender.color)
-        applyIcon(to: i.appPath, colorHex: newHex)
-        if let idx = ConfigStore.shared.instances.firstIndex(where: { $0.id == i.id }) {
-            ConfigStore.shared.instances[idx].colorHex = newHex
+        // 用带「确定/取消」的弹窗替代无确认按钮的 NSColorPanel：
+        // 颜色选择器只做预览，点「确定」才写入，避免拖一下就生效、用户不知何时确认。
+        let alert = NSAlert()
+        alert.messageText = "更换实例颜色"
+        alert.informativeText = "选好后点「确定」应用。"
+        alert.addButton(withTitle: "确定")
+        alert.addButton(withTitle: "取消")
+        let well = NSColorWell(frame: NSRect(x: 0, y: 0, width: 220, height: 32))
+        well.color = color(i.colorHex)
+        alert.accessoryView = well
+        if alert.runModal() == .alertFirstButtonReturn {
+            let newHex = hex(well.color)
+            guard newHex != i.colorHex else { return }
+            applyIcon(to: i.appPath, colorHex: newHex)
+            if let idx = ConfigStore.shared.instances.firstIndex(where: { $0.id == i.id }) {
+                ConfigStore.shared.instances[idx].colorHex = newHex
+            }
+            ConfigStore.shared.save()
+            refreshList()
+            restartRunningInstanceIfNeeded(i)
         }
-        ConfigStore.shared.save()
-        refreshList()
+    }
+
+    /// 正在运行的实例 Dock 图标来自进程自身，改 bundle 图标不会热更新；
+    /// 需退出重开才能让程序坞那枚图标换成新颜色（由用户确认，避免丢未发消息）。
+    private func restartRunningInstanceIfNeeded(_ i: Instance) {
+        let running = NSWorkspace.shared.runningApplications.filter { app in
+            guard let p = app.bundleURL?.resolvingSymlinksInPath().path else { return false }
+            return p == i.appPath || p == (i.appPath as NSString).resolvingSymlinksInPath
+        }
+        guard !running.isEmpty else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "重启“\(i.name)”以刷新程序坞图标"
+        alert.informativeText = "颜色已应用，但该实例正在运行，程序坞仍显示旧图标。需要退出并重新打开它。现在重启？"
+        alert.addButton(withTitle: "立即重启")
+        alert.addButton(withTitle: "稍后手动")
+        if alert.runModal() == .alertFirstButtonReturn {
+            running.forEach { $0.terminate() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                for _ in running { self?.mgr.launch(i.appPath) }
+            }
+        }
     }
 
     @objc private func deletePressed(_ s: NSButton) {
